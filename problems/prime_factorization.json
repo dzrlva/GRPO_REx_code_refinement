@@ -1,0 +1,28 @@
+{
+  "id": "prime_factorization",
+  "prompt": "Write a function `prime_factors(n)` that returns a list of all prime factors of a positive integer n in ascending order. For example, prime_factors(12) should return [2, 2, 3] and prime_factors(13) should return [13].\n\nYour function should handle inputs n >= 2 and should be reasonably efficient for large values of n.",
+  "tests": [
+    "assert prime_factors(2) == [2]",
+    "assert prime_factors(3) == [3]",
+    "assert prime_factors(4) == [2, 2]",
+    "assert prime_factors(6) == [2, 3]",
+    "assert prime_factors(8) == [2, 2, 2]",
+    "assert prime_factors(12) == [2, 2, 3]",
+    "assert prime_factors(13) == [13]",
+    "assert prime_factors(24) == [2, 2, 2, 3]",
+    "assert prime_factors(36) == [2, 2, 3, 3]",
+    "assert prime_factors(97) == [97]",
+    "assert prime_factors(100) == [2, 2, 5, 5]",
+    "assert prime_factors(999) == [3, 3, 3, 37]",
+    "assert prime_factors(1000) == [2, 2, 2, 5, 5, 5]"
+  ],
+  "solutions": [
+    "def prime_factors(n):\n    factors = []\n    divisor = 2\n    while n > 1:\n        while n % divisor == 0:\n            factors.append(divisor)\n            n //= divisor\n        divisor += 1\n    return factors",
+    
+    "def prime_factors(n):\n    i = 2\n    factors = []\n    while i * i <= n:\n        if n % i:\n            i += 1\n        else:\n            n //= i\n            factors.append(i)\n    if n > 1:\n        factors.append(n)\n    return factors",
+    
+    "def prime_factors(n):\n    factors = []\n    # Check for division by 2\n    while n % 2 == 0:\n        factors.append(2)\n        n //= 2\n    # Check for division by odd numbers\n    i = 3\n    while i * i <= n:\n        while n % i == 0:\n            factors.append(i)\n            n //= i\n        i += 2\n    # If n is a prime number greater than 2\n    if n > 2:\n        factors.append(n)\n    return factors",
+    
+    "def prime_factors(n):\n    def is_prime(x):\n        if x <= 1:\n            return False\n        if x <= 3:\n            return True\n        if x % 2 == 0 or x % 3 == 0:\n            return False\n        i = 5\n        while i * i <= x:\n            if x % i == 0 or x % (i + 2) == 0:\n                return False\n            i += 6\n        return True\n    \n    factors = []\n    for i in range(2, int(n**0.5) + 1):\n        if is_prime(i):\n            while n % i == 0:\n                factors.append(i)\n                n //= i\n    if n > 1:\n        factors.append(n)\n    return factors"
+  ]
+} 
