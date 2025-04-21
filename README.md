@@ -1,19 +1,22 @@
-# SMILES2025 REx: Refinement Tree Exploration for Code Generation
+# SMILES2025: Tree-Augmented RL for Autonomous Repair of AI-Generated Code
 
-This module implements the Refinement Tree Exploration (REx) algorithm for code generation. REx uses a Monte Carlo Tree Search (MCTS) inspired approach to balance exploration and exploitation when refining code solutions.
+This module implements the Iterative Refinement Tree algorithm for code generation with GRPO pipeline. 
 
 ## Key Components
 
 - **Refinement Tree**: A tree structure where each node represents a program, and children are refinements of the parent program.
-- **Code Generator**: Generates and refines code using large language models (Qwen, CodeLlama, DeepSeek).
+- **Code Generator**: Generates and refines code using large language models (Qwen).
 - **Reward Model**: Evaluates code solutions based on test execution and/or neural model predictions.
-- **REx Algorithm**: Balances exploration and exploitation using Upper Confidence Bound (UCB) scores.
+- **REx Algorithm**: Balances exploration and exploitation using Thompson Sampling-based algorithm.
+
+<img width="832" alt="Снимок экрана 2025-04-21 в 20 12 22" src="https://github.com/user-attachments/assets/644bb231-bde4-4fcd-bd2e-9231c78b112b" />
+
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone dzrlva/SMILES2025_project
 cd SMILES2025_project
 
 # Install dependencies
@@ -32,50 +35,28 @@ python main.py --problem_path problems/fibonacci.json --model_type qwen
 
 - `--problem_path`: Path to the problem JSON file (required)
 - `--output_dir`: Directory to save results (default: 'results')
-- `--model_type`: Type of code generation model to use (choices: 'qwen', 'codellama', 'deepseek', default: 'qwen')
+- `--model_type`: Type of code generation model to use (default: 'qwen')
 - `--model_path`: Path or name of the model to use for code generation (default: model-specific)
 - `--reward_model_path`: Path to neural reward model (if None, uses execution-only reward)
-- `--max_iterations`: Maximum number of iterations for the REx algorithm (default: 20)
+- `--max_iterations`: Maximum number of iterations for Iterative Refinement Tree algorithm (default: 20)
 - `--max_depth`: Maximum depth of the refinement tree (default: 5)
-- `--exploration_coefficient`: Exploration coefficient for UCB calculation (default: 0.5)
+- `--exploration_coefficient`: Exploration coefficient C calculation (default: 0.5)
 - `--min_reward_threshold`: Minimum reward threshold to consider a problem solved (default: 0.8)
 - `--temperature`: Temperature for code generation (default: 0.7)
 - `--save_tree`: Save the full refinement tree in the results (default: False)
-
-### Problem JSON Format
-
-Problems are defined in JSON files with the following structure:
-
-```json
-{
-  "id": "problem_id",
-  "prompt": "Problem description...",
-  "tests": [
-    "assert function_name(args) == expected_output",
-    ...
-  ],
-  "solutions": [
-    "def function_name(args):\n    ...",
-    ...
-  ]
-}
-```
 
 ### Example
 
 ```bash
 # Run the REx algorithm on the Fibonacci problem using Qwen model
 python main.py --problem_path problems/fibonacci.json --model_type qwen --max_iterations 30 --temperature 0.8
-
-# Run on prime factorization problem using DeepSeek model with custom exploration coefficient
-python main.py --problem_path problems/prime_factorization.json --model_type deepseek --exploration_coefficient 0.7
 ```
 
 ## Implementation Details
 
 ### Refinement Tree
 
-The refinement tree is implemented in `refinement_tree.py`. It uses a beta distribution to select nodes for refinement based on their UCB scores, which balance exploration and exploitation.
+The refinement tree is implemented in `refinement_tree.py`. It uses a beta distribution to select nodes for refinement based on their reward scores, which balance exploration and exploitation.
 
 ### Reward Model
 
@@ -88,8 +69,6 @@ The reward model in `reward_model.py` provides three implementations:
 
 The code generator in `code_generator.py` supports multiple LLM architectures:
 - `QwenCodeGenerator`: Uses Qwen models.
-- `CodeLlamaGenerator`: Uses CodeLlama models.
-- `DeepseekCoderGenerator`: Uses DeepSeek Coder models.
 
 ## Requirements
 
