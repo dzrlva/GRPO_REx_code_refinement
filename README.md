@@ -48,7 +48,7 @@ python main.py --problem_path problems/fibonacci.json --model_type qwen
 ### Example
 
 ```bash
-# Run the REx algorithm on the Fibonacci problem using Qwen model
+# Run the Iterative Refinement Tree algorithm on the Fibonacci problem using Qwen model
 python main.py --problem_path problems/fibonacci.json --model_type qwen --max_iterations 30 --temperature 0.8
 ```
 
