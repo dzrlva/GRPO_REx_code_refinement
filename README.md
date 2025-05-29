@@ -1,4 +1,4 @@
-# SMILES2025: Tree-Augmented RL for Autonomous Repair of AI-Generated Code
+# Tree-Augmented RL for Autonomous Repair of AI-Generated Code
 
 This module implements the Iterative Refinement Tree algorithm for code generation with GRPO pipeline. 
 
