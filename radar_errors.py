@@ -20,6 +20,7 @@ MODEL_LABELS = {
 categories = ['Syntax', 'Semantic', 'Algorithmic', 'Runtime/TLE', 'Interpretation', 'Hallucination']
 N = len(categories)
 
+# load error stats
 data = {
     'GPT35':    [14.5, 20.2, 24.8, 13.5, 18.0, 19.5],
     'DeepSeek': [11.5, 16.5, 19.1, 12.1, 14.2, 15.5],
