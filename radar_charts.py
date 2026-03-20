@@ -28,6 +28,7 @@ MODEL_OFFSETS = {
 categories = ['LiveCodeBench', 'HumanEval', 'MBPP', 'APPS', 'Codeforces']
 N = len(categories)
 
+# load results pass@1
 data_p1 = {
     'Pretrained': [32.5, 68.0, 59.0, 41.0, 48.2],
     'PPO':        [48.2, 81.2, 74.5, 56.5, 62.5],
@@ -35,6 +36,7 @@ data_p1 = {
     'TGPR':       [55.8, 87.1, 82.1, 62.4, 65.8],
 }
 
+# load results pass@10
 data_p10 = {
     'Pretrained': [44.2, 84.7, 75.1, 47.8, 58.3],
     'PPO':        [63.5, 94.5, 82.2, 60.2, 72.0],
