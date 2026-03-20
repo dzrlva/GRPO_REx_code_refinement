@@ -1,173 +1,184 @@
 #!/usr/bin/env python3
+"""
+Main entry point for TGPR tree search.
+
+Runs Thompson Sampling-guided tree search for code refinement
+using Qwen2.5-7B-Instruct as the policy model.
+"""
+
 import os
 import json
 import argparse
 import logging
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
-from refinement_tree import RefinementTree, RefinementTreeConfig, Program, CodeProblem
+from refinement_tree import RefinementTree, TreeConfig, CodeProblem
 from reward_model import ExecutionRewardModel, NeuralRewardModel, HybridRewardModel
-from code_generator import QwenCodeGenerator, CodeLlamaGenerator, DeepseekCoderGenerator
+from code_generator import QwenCodeGenerator
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("refinement_tree_run.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("tgpr_run.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_POLICY_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_REWARD_MODEL = "Qwen/Qwen2.5-1.5B"
+
+
 def load_problem(problem_path: str) -> CodeProblem:
     """Load a code problem from a JSON file."""
-    with open(problem_path, 'r') as f:
-        problem_data = json.load(f)
-    
+    with open(problem_path, "r") as f:
+        data = json.load(f)
+
     return CodeProblem(
-        id=problem_data.get('id', 'unknown'),
-        prompt=problem_data.get('prompt', ''),
-        tests=problem_data.get('tests', []),
-        solutions=problem_data.get('solutions', [])
+        problem_id=data.get("problem_id", "unknown"),
+        prompt=data.get("prompt", ""),
+        tests=data.get("tests", []),
+        reference_solution=data.get("reference_solution", None),
+        buggy_solution=data.get("buggy_solution", None),
     )
+
 
 def save_results(results: Dict[str, Any], output_dir: str, problem_id: str) -> None:
     """Save results to a JSON file."""
     os.makedirs(output_dir, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(output_dir, f"{problem_id}_{timestamp}.json")
-    
-    with open(output_path, 'w') as f:
+
+    with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
-    
+
     logger.info(f"Results saved to {output_path}")
 
+
 def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Run refinement tree exploration for code generation')
-    
-    parser.add_argument('--problem_path', type=str, required=True,
-                        help='Path to the problem JSON file')
-    
-    parser.add_argument('--output_dir', type=str, default='results',
-                        help='Directory to save results')
-    
-    parser.add_argument('--model_type', type=str, default='qwen',
-                        choices=['qwen', 'codellama', 'deepseek'],
-                        help='Type of code generation model to use')
-    
-    parser.add_argument('--model_path', type=str,
-                        help='Path or name of the model to use for code generation')
-    
-    parser.add_argument('--reward_model_path', type=str,
-                        help='Path to neural reward model (if None, uses execution-only reward)')
-    
-    parser.add_argument('--max_iterations', type=int, default=20,
-                        help='Maximum number of iterations for the REx algorithm')
-    
-    parser.add_argument('--max_depth', type=int, default=5,
-                        help='Maximum depth of the refinement tree')
-    
-    parser.add_argument('--exploration_coefficient', type=float, default=0.5,
-                        help='Exploration coefficient for UCB calculation')
-    
-    parser.add_argument('--min_reward_threshold', type=float, default=0.8,
-                        help='Minimum reward threshold to consider a problem solved')
-    
-    parser.add_argument('--temperature', type=float, default=0.7,
-                        help='Temperature for code generation')
-    
-    parser.add_argument('--save_tree', action='store_true',
-                        help='Save the full refinement tree in the results')
-    
+    """Parse command line arguments matching paper hyperparameters."""
+    parser = argparse.ArgumentParser(
+        description="TGPR: Thompson Sampling-guided tree search for code refinement"
+    )
+
+    parser.add_argument(
+        "--problem_path", type=str, required=True,
+        help="Path to the problem JSON file",
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default="results",
+        help="Directory to save results",
+    )
+    parser.add_argument(
+        "--model_path", type=str, default=DEFAULT_POLICY_MODEL,
+        help="Path to policy model (default: Qwen2.5-7B-Instruct)",
+    )
+    parser.add_argument(
+        "--reward_model_path", type=str, default=DEFAULT_REWARD_MODEL,
+        help="Path to reward model (default: Qwen2.5-1.5B)",
+    )
+    parser.add_argument(
+        "--max_iterations", type=int, default=20,
+        help="Maximum tree search iterations",
+    )
+    parser.add_argument(
+        "--max_depth", type=int, default=5,
+        help="Maximum tree depth",
+    )
+    parser.add_argument(
+        "--branching_factor", type=int, default=4,
+        help="Children per node",
+    )
+    parser.add_argument(
+        "--exploration_coefficient", type=float, default=2.0,
+        help="Thompson Sampling coefficient C",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.8,
+        help="Generation temperature",
+    )
+    parser.add_argument(
+        "--top_p", type=float, default=0.95,
+        help="Top-p sampling",
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=50,
+        help="Top-k sampling",
+    )
+    parser.add_argument(
+        "--save_tree", action="store_true",
+        help="Save full refinement tree in results",
+    )
+
     return parser.parse_args()
 
-def create_code_generator(model_type: str, model_path: Optional[str], temperature: float):
-    """Create a code generator based on model type and path."""
-    if model_type == 'qwen':
-        model_path = model_path or "Qwen/Qwen2.5-1.5B-Coder-Instruct"
-        return QwenCodeGenerator(model_name_or_path=model_path, temperature=temperature)
-    elif model_type == 'codellama':
-        model_path = model_path or "codellama/CodeLlama-7b-Instruct-hf"
-        return CodeLlamaGenerator(model_name_or_path=model_path, temperature=temperature)
-    elif model_type == 'deepseek':
-        model_path = model_path or "deepseek-ai/deepseek-coder-1.3b-instruct"
-        return DeepseekCoderGenerator(model_name_or_path=model_path, temperature=temperature)
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
 
 def main():
-    """Main entry point."""
     args = parse_arguments()
-    
-    # Load the problem
+
     problem = load_problem(args.problem_path)
-    logger.info(f"Loaded problem: {problem.id}")
-    
-    # Create the code generator
-    code_generator = create_code_generator(
-        model_type=args.model_type,
-        model_path=args.model_path,
-        temperature=args.temperature
-    )
-    
-    # Create the reward model
-    if args.reward_model_path:
-        # Use hybrid reward model with both execution and neural models
-        neural_reward = NeuralRewardModel(model_path=args.reward_model_path)
-        reward_model = HybridRewardModel(
-            execution_model=ExecutionRewardModel(),
-            neural_model=neural_reward
-        )
-    else:
-        # Use execution-only reward model
-        reward_model = ExecutionRewardModel()
-    
-    # Configure the refinement tree
-    config = RefinementTreeConfig(
-        max_depth=args.max_depth,
-        exploration_coefficient=args.exploration_coefficient,
+    logger.info(f"Loaded problem: {problem.problem_id}")
+
+    code_generator = QwenCodeGenerator(
+        model_name_or_path=args.model_path,
         temperature=args.temperature,
+    )
+
+    neural_reward = NeuralRewardModel(model_path=args.reward_model_path)
+    reward_model = HybridRewardModel(
+        execution_model=ExecutionRewardModel(),
+        neural_model=neural_reward,
+    )
+
+    config = TreeConfig(
+        max_depth=args.max_depth,
+        branching_factor=args.branching_factor,
+        ts_coefficient=args.exploration_coefficient,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         max_iterations=args.max_iterations,
-        min_reward_threshold=args.min_reward_threshold
     )
-    
-    # Create the refinement tree
-    refinement_tree = RefinementTree(
-        problem=problem,
-        code_generator=code_generator,
+
+    tree = RefinementTree(
+        model=code_generator.model,
+        tokenizer=code_generator.tokenizer,
         reward_model=reward_model,
-        config=config
+        config=config,
     )
-    
-    # Run the REx algorithm
-    results = refinement_tree.run_REx()
-    
-    # Add additional information to results
-    results['problem_id'] = problem.id
-    results['config'] = config.__dict__
-    results['model_type'] = args.model_type
-    results['model_path'] = args.model_path or "default"
-    
-    # Save the full tree if requested
+
+    best_program, metrics = tree.search(problem)
+
+    results = {
+        "problem_id": problem.problem_id,
+        "best_code": best_program.code,
+        "best_reward": best_program.reward,
+        "config": {
+            "model_path": args.model_path,
+            "reward_model_path": args.reward_model_path,
+            "max_depth": config.max_depth,
+            "branching_factor": config.branching_factor,
+            "ts_coefficient": config.ts_coefficient,
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "top_k": config.top_k,
+        },
+        **metrics,
+    }
+
     if not args.save_tree:
-        results.pop('tree', None)
-    
-    # Save results
-    save_results(results, args.output_dir, problem.id)
-    
-    # Print the best solution
-    if results['best_program']:
-        print("\n" + "="*80)
-        print(f"Best solution (reward: {results['best_reward']:.4f}):")
-        print("="*80)
-        print(results['best_program'])
-        print("="*80)
-    else:
-        print("\nNo solution found.")
+        results.pop("tree", None)
+
+    save_results(results, args.output_dir, problem.problem_id)
+
+    print(f"\n{'='*80}")
+    print(f"Best solution (reward: {best_program.reward:.4f}):")
+    print(f"{'='*80}")
+    print(best_program.code)
+    print(f"{'='*80}")
+
 
 if __name__ == "__main__":
-    main() 
+    main()
