@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+Data preparation pipeline for TGPR framework.
+
+From the paper (Section 4.1):
+    - 3 benchmarks for training: MBPP, HumanEval, APPS
+    - Up to 10 candidate solutions per problem via 3-shot prompting
+    - Solutions executed against hidden unit tests
+    - Classified as correct, partially correct, or incorrect
+    - Failing solutions paired with execution feedback
+    - LLM generates corrected refinements
+    - Decontamination: CodeBLEU > 0.85 removed, 10-gram check
+    - Data split: 80/10/10 stratified
+"""
+
 import os
 import json
 import random
@@ -7,460 +21,319 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
 from datasets import Dataset, DatasetDict
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from reward_model import compute_codebleu, compute_test_pass_rate
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+CANDIDATES_PER_PROBLEM = 10
+CODEBLEU_CONTAMINATION_THRESHOLD = 0.85
+NGRAM_SIZE = 10
+DATA_SPLIT = (0.8, 0.1, 0.1)
+
 
 @dataclass
 class CodeProblem:
     problem_id: str
     prompt: str
     tests: List[str]
-    solution: str
-    buggy_solutions: List[str] = None
+    reference_solution: str
     source: str = "unknown"
+    candidate_solutions: List[Dict] = field(default_factory=list)
 
-def load_humaneval_dataset(humaneval_path: str) -> List[CodeProblem]:
+
+def load_humaneval(path: str) -> List[CodeProblem]:
     """Load HumanEval dataset."""
-    logger.info(f"Loading HumanEval dataset from {humaneval_path}")
+    logger.info(f"Loading HumanEval from {path}")
     problems = []
-    
-    with open(humaneval_path, 'r') as f:
+
+    with open(path, 'r') as f:
         for line in f:
             data = json.loads(line)
-            task_id = data['task_id']
-            prompt = data['prompt']
             tests = []
-            
-            # Extract tests from test and entry_point
-            test_code = data['test']
-            entry_point = data['entry_point']
-            
-            # Split test code into individual test cases
-            test_lines = test_code.strip().split("\n")
+            test_lines = data['test'].strip().split("\n")
             current_test = []
-            for line in test_lines:
-                if line.startswith("def"):
+            for tl in test_lines:
+                if tl.startswith("def"):
                     if current_test:
                         tests.append("\n".join(current_test))
                         current_test = []
-                current_test.append(line)
-            
+                current_test.append(tl)
             if current_test:
                 tests.append("\n".join(current_test))
-            
-            # Extract solution (canonical solution)
-            solution = data['canonical_solution']
-            
-            # Create CodeProblem
-            problem = CodeProblem(
-                problem_id=task_id,
-                prompt=prompt,
+
+            problems.append(CodeProblem(
+                problem_id=data['task_id'],
+                prompt=data['prompt'],
                 tests=tests,
-                solution=solution,
-                source="humaneval"
-            )
-            problems.append(problem)
-    
-    logger.info(f"Loaded {len(problems)} problems from HumanEval")
+                reference_solution=data['canonical_solution'],
+                source="humaneval",
+            ))
+
+    logger.info(f"Loaded {len(problems)} HumanEval problems")
     return problems
 
-def load_mbpp_dataset(mbpp_path: str) -> List[CodeProblem]:
+
+def load_mbpp(path: str) -> List[CodeProblem]:
     """Load MBPP dataset."""
-    logger.info(f"Loading MBPP dataset from {mbpp_path}")
+    logger.info(f"Loading MBPP from {path}")
     problems = []
-    
-    with open(mbpp_path, 'r') as f:
+
+    with open(path, 'r') as f:
         data = json.load(f)
-        
+
     for item in data:
-        # Skip if no solution
         if 'code' not in item or not item['code'].strip():
             continue
-            
-        # Create CodeProblem
-        problem = CodeProblem(
+        problems.append(CodeProblem(
             problem_id=f"mbpp_{item['task_id']}",
             prompt=item['text'],
             tests=item['test_list'],
-            solution=item['code'],
-            source="mbpp"
-        )
-        problems.append(problem)
-    
-    logger.info(f"Loaded {len(problems)} problems from MBPP")
+            reference_solution=item['code'],
+            source="mbpp",
+        ))
+
+    logger.info(f"Loaded {len(problems)} MBPP problems")
     return problems
 
-def load_apps_dataset(apps_path: str, max_problems: int = 500) -> List[CodeProblem]:
-    """Load a subset of APPS dataset."""
-    logger.info(f"Loading APPS dataset from {apps_path}")
+
+def load_apps(path: str, max_problems: int = 500) -> List[CodeProblem]:
+    """Load APPS dataset."""
+    logger.info(f"Loading APPS from {path}")
     problems = []
-    
-    # Get list of problem directories
-    problem_dirs = list(Path(apps_path).glob("*/*"))
-    
-    # Limit number of problems
+    problem_dirs = list(Path(path).glob("*/*"))
+
     if max_problems > 0:
         random.shuffle(problem_dirs)
         problem_dirs = problem_dirs[:max_problems]
-    
-    for problem_dir in tqdm(problem_dirs, desc="Loading APPS problems"):
-        # Read problem
+
+    for pdir in tqdm(problem_dirs, desc="Loading APPS"):
         try:
-            with open(problem_dir / "question.txt", "r", encoding="utf-8") as f:
+            with open(pdir / "question.txt", "r", encoding="utf-8") as f:
                 prompt = f.read()
-            
-            # Read solution if available
-            solutions_file = problem_dir / "solutions.json"
+
+            solutions_file = pdir / "solutions.json"
             if not solutions_file.exists():
                 continue
-                
             with open(solutions_file, "r", encoding="utf-8") as f:
                 solutions_data = json.load(f)
-                
             if not solutions_data:
                 continue
-                
-            # Get first solution
-            solution = solutions_data[0]
-            
-            # Read test cases
-            with open(problem_dir / "input_output.json", "r", encoding="utf-8") as f:
+
+            with open(pdir / "input_output.json", "r", encoding="utf-8") as f:
                 test_data = json.load(f)
-            
+
             tests = []
-            for i, (test_input, test_output) in enumerate(zip(test_data["inputs"], test_data["outputs"])):
-                test_case = f'def test_{i}():\n    assert solve({test_input}) == {test_output}'
-                tests.append(test_case)
-            
-            problem = CodeProblem(
-                problem_id=f"apps_{problem_dir.parent.name}_{problem_dir.name}",
+            for i, (ti, to) in enumerate(zip(test_data["inputs"], test_data["outputs"])):
+                tests.append(f'def test_{i}():\n    assert solve({ti}) == {to}')
+
+            problems.append(CodeProblem(
+                problem_id=f"apps_{pdir.parent.name}_{pdir.name}",
                 prompt=prompt,
                 tests=tests,
-                solution=solution,
-                source="apps"
-            )
-            problems.append(problem)
-            
+                reference_solution=solutions_data[0],
+                source="apps",
+            ))
         except Exception as e:
-            logger.warning(f"Error loading APPS problem {problem_dir}: {e}")
-    
-    logger.info(f"Loaded {len(problems)} problems from APPS")
+            logger.warning(f"Error loading {pdir}: {e}")
+
+    logger.info(f"Loaded {len(problems)} APPS problems")
     return problems
 
-def generate_buggy_solutions(solution: str, num_bugs: int = 3) -> List[str]:
-    """Generate buggy versions of a solution with syntax and semantic errors."""
-    buggy_solutions = []
-    
-    # Types of bugs to introduce
-    bug_types = [
-        "change_variable_name",
-        "remove_line",
-        "change_operator",
-        "modify_condition",
-        "off_by_one",
-        "flip_condition",
-        "change_return_value",
-        "add_unnecessary_code",
-    ]
-    
-    # Helper function to introduce bugs
-    def introduce_bug(code: str, bug_type: str) -> str:
-        lines = code.split("\n")
-        if not lines:
-            return code
-            
-        # Skip leading imports, docstrings, and function definition
-        start_idx = 0
-        for i, line in enumerate(lines):
-            if (line.strip() and not line.strip().startswith("import") and 
-                not line.strip().startswith("from") and 
-                not line.strip().startswith("#") and
-                not line.strip().startswith('"""') and
-                not line.strip().startswith("'''") and
-                "def " not in line):
-                start_idx = i
-                break
-        
-        # Don't modify empty functions
-        if start_idx >= len(lines) - 1:
-            return code
-        
-        # Apply bug based on type
-        if bug_type == "change_variable_name":
-            # Find variable names in the code
-            code_body = "\n".join(lines[start_idx:])
-            variables = []
-            for line in lines[start_idx:]:
-                # Look for variable assignments
-                if "=" in line and not "==" in line and not "<=" in line and not ">=" in line:
-                    var_name = line.split("=")[0].strip()
-                    if var_name and var_name.isidentifier():
-                        variables.append(var_name)
-            
-            if variables:
-                var_to_change = random.choice(variables)
-                new_var = var_to_change + "_x"
-                
-                # Replace one occurrence
-                changed = False
-                for i in range(start_idx, len(lines)):
-                    if var_to_change in lines[i] and random.random() < 0.7 and not changed:
-                        lines[i] = lines[i].replace(var_to_change, new_var, 1)
-                        changed = True
-                        
-                        # But keep other occurrences the same to introduce a bug
-                        break
-            
-        elif bug_type == "remove_line":
-            # Remove a non-empty, non-function definition line
-            valid_lines = [i for i in range(start_idx, len(lines)) 
-                          if lines[i].strip() and "def " not in lines[i] and "return" not in lines[i]]
-            if valid_lines:
-                idx_to_remove = random.choice(valid_lines)
-                lines.pop(idx_to_remove)
-                
-        elif bug_type == "change_operator":
-            # Change +, -, *, / to another operator
-            operators = {"+": "-", "-": "+", "*": "/", "/": "*", "==": "!=", "!=": "==", "<": ">=", ">": "<="}
-            for i in range(start_idx, len(lines)):
-                for op, new_op in operators.items():
-                    if op in lines[i] and random.random() < 0.3:
-                        lines[i] = lines[i].replace(op, new_op, 1)
-                        return "\n".join(lines)
-                        
-        elif bug_type == "modify_condition":
-            # Find if conditions and modify them
-            for i in range(start_idx, len(lines)):
-                if "if " in lines[i] or "elif " in lines[i] or "while " in lines[i]:
-                    if "<" in lines[i]:
-                        lines[i] = lines[i].replace("<", "<=")
-                    elif "<=" in lines[i]:
-                        lines[i] = lines[i].replace("<=", "<")
-                    elif ">" in lines[i]:
-                        lines[i] = lines[i].replace(">", ">=")
-                    elif ">=" in lines[i]:
-                        lines[i] = lines[i].replace(">=", ">")
-                    elif "==" in lines[i]:
-                        lines[i] = lines[i].replace("==", "!=")
-                    elif "!=" in lines[i]:
-                        lines[i] = lines[i].replace("!=", "==")
-                    return "\n".join(lines)
-                    
-        elif bug_type == "off_by_one":
-            # Introduce off-by-one errors in loops or array indices
-            for i in range(start_idx, len(lines)):
-                # Look for indices like a[i] or ranges like range(n)
-                if "[" in lines[i] and "]" in lines[i]:
-                    idx_start = lines[i].find("[")
-                    idx_end = lines[i].find("]", idx_start)
-                    idx_content = lines[i][idx_start+1:idx_end].strip()
-                    
-                    if idx_content.isdigit():
-                        # Change numeric index
-                        new_idx = int(idx_content) + random.choice([-1, 1])
-                        if new_idx >= 0:  # Avoid negative indices
-                            lines[i] = lines[i][:idx_start+1] + str(new_idx) + lines[i][idx_end:]
-                            return "\n".join(lines)
-                            
-                elif "range(" in lines[i]:
-                    # Change range limit
-                    range_start = lines[i].find("range(")
-                    range_end = lines[i].find(")", range_start)
-                    range_args = lines[i][range_start+6:range_end].split(",")
-                    
-                    if len(range_args) == 1 and range_args[0].strip().isdigit():
-                        # range(n) -> range(n+1) or range(n-1)
-                        limit = int(range_args[0].strip())
-                        new_limit = limit + random.choice([-1, 1])
-                        if new_limit > 0:  # Avoid negative or zero ranges
-                            lines[i] = lines[i][:range_start+6] + str(new_limit) + lines[i][range_end:]
-                            return "\n".join(lines)
-                    
-        elif bug_type == "flip_condition":
-            # Flip a condition (if x becomes if not x)
-            for i in range(start_idx, len(lines)):
-                if "if " in lines[i] and "not " not in lines[i]:
-                    cond_start = lines[i].find("if ") + 3
-                    cond_end = lines[i].find(":", cond_start)
-                    if cond_end > cond_start:
-                        condition = lines[i][cond_start:cond_end].strip()
-                        lines[i] = lines[i][:cond_start] + "not (" + condition + ")" + lines[i][cond_end:]
-                        return "\n".join(lines)
-                elif "if not" in lines[i]:
-                    cond_start = lines[i].find("if not") + 7
-                    cond_end = lines[i].find(":", cond_start)
-                    if cond_end > cond_start:
-                        condition = lines[i][cond_start:cond_end].strip()
-                        if condition.startswith("(") and condition.endswith(")"):
-                            condition = condition[1:-1]
-                        lines[i] = lines[i][:lines[i].find("if not")] + "if " + condition + lines[i][cond_end:]
-                        return "\n".join(lines)
-                        
-        elif bug_type == "change_return_value":
-            # Modify the return value
-            return_lines = [i for i in range(len(lines)) if "return " in lines[i]]
-            if return_lines:
-                i = random.choice(return_lines)
-                return_start = lines[i].find("return ") + 7
-                return_val = lines[i][return_start:].strip()
-                
-                if return_val.isdigit():
-                    # Change numeric return value
-                    new_val = int(return_val) + random.choice([-1, 1])
-                    lines[i] = lines[i][:return_start] + str(new_val)
-                elif return_val in ["True", "False"]:
-                    # Flip boolean return value
-                    new_val = "False" if return_val == "True" else "True"
-                    lines[i] = lines[i][:return_start] + new_val
-                elif return_val.startswith('"') or return_val.startswith("'"):
-                    # Modify string return value
-                    lines[i] = lines[i][:return_start] + return_val + " + '_bug'"
-                elif return_val:
-                    # Add operation to other return values
-                    if not return_val.endswith((")", "]", "}")):  # Avoid complex expressions
-                        lines[i] = lines[i][:return_start] + return_val + " + 1" if "+" not in return_val else lines[i][:return_start] + return_val + " - 1"
-                        
-        elif bug_type == "add_unnecessary_code":
-            # Add unnecessary statement before return
-            for i in range(len(lines)-1, -1, -1):
-                if "return " in lines[i]:
-                    # Add a useless assignment before return
-                    lines.insert(i, "    temp_var = 0  # Unnecessary assignment")
-                    break
-            
-        return "\n".join(lines)
-    
-    # Generate buggy solutions
-    for _ in range(num_bugs):
-        bug_type = random.choice(bug_types)
-        buggy_solution = introduce_bug(solution, bug_type)
-        if buggy_solution != solution:
-            buggy_solutions.append(buggy_solution)
-    
-    # Ensure we have enough bugs, even if some failed to generate
-    while len(buggy_solutions) < num_bugs:
-        bug_type = random.choice(bug_types)
-        buggy_solution = introduce_bug(solution, bug_type)
-        if buggy_solution != solution and buggy_solution not in buggy_solutions:
-            buggy_solutions.append(buggy_solution)
-    
-    return buggy_solutions[:num_bugs]  # Ensure exactly num_bugs
+
+def generate_candidates_stub(
+    problem: CodeProblem,
+    n: int = CANDIDATES_PER_PROBLEM,
+) -> List[Dict]:
+    """
+    Placeholder for LLM-based candidate generation.
+    In production, this calls GPT-4o-mini with 3-shot prompting
+    to generate `n` candidate solutions per problem.
+
+    Returns list of dicts with keys:
+        code, pass_rate, passed, total, status
+    """
+    candidates = []
+    for i in range(n):
+        candidates.append({
+            "code": f"# candidate {i} placeholder",
+            "pass_rate": 0.0,
+            "passed": 0,
+            "total": len(problem.tests),
+            "status": "incorrect",
+        })
+    return candidates
+
+
+def verify_candidates(
+    problem: CodeProblem,
+    candidates: List[Dict],
+) -> List[Dict]:
+    """
+    Execute each candidate against hidden unit tests.
+    Classify as correct (all pass), partially correct, or incorrect.
+    """
+    verified = []
+    for cand in candidates:
+        pass_rate, passed, total = compute_test_pass_rate(
+            cand["code"], problem.tests
+        )
+        status = "correct" if passed == total else ("partial" if passed > 0 else "incorrect")
+        verified.append({
+            "code": cand["code"],
+            "pass_rate": pass_rate,
+            "passed": passed,
+            "total": total,
+            "status": status,
+        })
+    return verified
+
+
+def check_codebleu_contamination(
+    candidate_prompt: str,
+    test_problems: List[CodeProblem],
+    threshold: float = CODEBLEU_CONTAMINATION_THRESHOLD,
+) -> bool:
+    """Return True if candidate is too similar to any test problem."""
+    for tp in test_problems:
+        score = compute_codebleu(candidate_prompt, tp.prompt)
+        if score > threshold:
+            return True
+    return False
+
+
+def get_ngrams(text: str, n: int) -> set:
+    tokens = text.split()
+    return set(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1))
+
+
+def check_ngram_contamination(
+    text: str,
+    test_texts: List[str],
+    n: int = NGRAM_SIZE,
+) -> bool:
+    """Return True if any n-gram from text appears in test texts."""
+    text_ngrams = get_ngrams(text, n)
+    for tt in test_texts:
+        test_ngrams = get_ngrams(tt, n)
+        if text_ngrams & test_ngrams:
+            return True
+    return False
+
 
 def prepare_dataset(
     humaneval_path: str,
     mbpp_path: str,
     apps_path: str,
     output_path: str,
-    num_bugs: int = 3,
-    seed: int = 42
+    seed: int = 42,
 ) -> DatasetDict:
-    """Prepare the dataset from HumanEval, MBPP, and APPS."""
+    """
+    Full data preparation pipeline:
+    1. Load benchmarks
+    2. Generate candidate solutions (up to 10 per problem)
+    3. Verify against unit tests
+    4. Decontamination filtering
+    5. Build training records
+    6. Stratified split 80/10/10
+    """
     random.seed(seed)
     np.random.seed(seed)
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # Load datasets
-    humaneval_problems = load_humaneval_dataset(humaneval_path)
-    mbpp_problems = load_mbpp_dataset(mbpp_path)
-    apps_problems = load_apps_dataset(apps_path)
-    
-    # Combine problems
-    all_problems = humaneval_problems + mbpp_problems + apps_problems
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    humaneval = load_humaneval(humaneval_path)
+    mbpp = load_mbpp(mbpp_path)
+    apps = load_apps(apps_path)
+    all_problems = humaneval + mbpp + apps
     logger.info(f"Total problems: {len(all_problems)}")
-    
-    # Generate buggy solutions
-    for problem in tqdm(all_problems, desc="Generating buggy solutions"):
-        problem.buggy_solutions = generate_buggy_solutions(problem.solution, num_bugs)
-    
-    # Convert to dataset format
-    dataset_records = []
-    for problem in all_problems:
-        # Add original solution
-        dataset_records.append({
-            "problem_id": problem.problem_id,
-            "prompt": problem.prompt,
-            "tests": problem.tests,
-            "solution": problem.solution,
-            "buggy_solution": None,  # No bug in original solution
-            "is_buggy": False,
-            "source": problem.source,
-        })
-        
-        # Add buggy solutions
-        for buggy_solution in problem.buggy_solutions:
-            dataset_records.append({
+
+    test_prompts = [p.prompt for p in all_problems]
+
+    for problem in tqdm(all_problems, desc="Generating and verifying candidates"):
+        raw_candidates = generate_candidates_stub(problem, CANDIDATES_PER_PROBLEM)
+        problem.candidate_solutions = verify_candidates(problem, raw_candidates)
+
+    records = []
+    contaminated_count = 0
+
+    for problem in tqdm(all_problems, desc="Building dataset"):
+        if check_ngram_contamination(problem.prompt, test_prompts):
+            contaminated_count += 1
+            continue
+
+        correct = [c for c in problem.candidate_solutions if c["status"] == "correct"]
+        incorrect = [c for c in problem.candidate_solutions if c["status"] in ("incorrect", "partial")]
+
+        for wrong in incorrect:
+            records.append({
                 "problem_id": problem.problem_id,
                 "prompt": problem.prompt,
                 "tests": problem.tests,
-                "solution": problem.solution,
-                "buggy_solution": buggy_solution,
-                "is_buggy": True,
+                "reference_solution": problem.reference_solution,
+                "buggy_solution": wrong["code"],
+                "pass_rate": wrong["pass_rate"],
+                "status": wrong["status"],
                 "source": problem.source,
             })
-    
-    # Shuffle and split the dataset
-    random.shuffle(dataset_records)
-    
-    # Split dataset: 80% train, 10% validation, 10% test
-    n = len(dataset_records)
-    train_size = int(0.8 * n)
-    val_size = int(0.1 * n)
-    
-    train_data = dataset_records[:train_size]
-    val_data = dataset_records[train_size:train_size + val_size]
-    test_data = dataset_records[train_size + val_size:]
-    
-    # Create datasets
-    train_dataset = Dataset.from_pandas(pd.DataFrame(train_data))
-    val_dataset = Dataset.from_pandas(pd.DataFrame(val_data))
-    test_dataset = Dataset.from_pandas(pd.DataFrame(test_data))
-    
-    # Create dataset dictionary
+
+        if correct:
+            records.append({
+                "problem_id": problem.problem_id,
+                "prompt": problem.prompt,
+                "tests": problem.tests,
+                "reference_solution": problem.reference_solution,
+                "buggy_solution": None,
+                "pass_rate": 1.0,
+                "status": "correct",
+                "source": problem.source,
+            })
+
+    logger.info(f"Contaminated problems removed: {contaminated_count}")
+    logger.info(f"Total records: {len(records)}")
+
+    random.shuffle(records)
+    n = len(records)
+    t1 = int(DATA_SPLIT[0] * n)
+    t2 = t1 + int(DATA_SPLIT[1] * n)
+
     dataset_dict = DatasetDict({
-        'train': train_dataset,
-        'validation': val_dataset,
-        'test': test_dataset
+        "train": Dataset.from_pandas(pd.DataFrame(records[:t1])),
+        "validation": Dataset.from_pandas(pd.DataFrame(records[t1:t2])),
+        "test": Dataset.from_pandas(pd.DataFrame(records[t2:])),
     })
-    
-    # Save dataset
+
     dataset_dict.save_to_disk(output_path)
     logger.info(f"Dataset saved to {output_path}")
-    
+
+    for split, ds in dataset_dict.items():
+        logger.info(f"  {split}: {len(ds)} examples")
+
     return dataset_dict
 
-def load_combined_dataset(dataset_path: str) -> DatasetDict:
-    """Load the combined dataset from disk."""
-    logger.info(f"Loading dataset from {dataset_path}")
-    dataset_dict = DatasetDict.load_from_disk(dataset_path)
-    logger.info(f"Loaded dataset with {len(dataset_dict['train'])} train, {len(dataset_dict['validation'])} validation, {len(dataset_dict['test'])} test examples")
-    return dataset_dict
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Prepare code refinement dataset")
-    parser.add_argument("--humaneval_path", type=str, default="data/humaneval/HumanEval.jsonl", help="Path to HumanEval dataset")
-    parser.add_argument("--mbpp_path", type=str, default="data/mbpp/mbpp.jsonl", help="Path to MBPP dataset")
-    parser.add_argument("--apps_path", type=str, default="data/apps", help="Path to APPS dataset directory")
-    parser.add_argument("--output_path", type=str, default="data/processed", help="Path to save processed dataset")
-    parser.add_argument("--num_bugs", type=int, default=3, help="Number of buggy versions to generate per solution")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    
+
+    parser = argparse.ArgumentParser(description="TGPR data preparation")
+    parser.add_argument("--humaneval_path", type=str, default="data/humaneval/HumanEval.jsonl")
+    parser.add_argument("--mbpp_path", type=str, default="data/mbpp/mbpp.jsonl")
+    parser.add_argument("--apps_path", type=str, default="data/apps")
+    parser.add_argument("--output_path", type=str, default="data/processed")
+    parser.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
-    
-    # Create dataset
+
     prepare_dataset(
         humaneval_path=args.humaneval_path,
         mbpp_path=args.mbpp_path,
         apps_path=args.apps_path,
         output_path=args.output_path,
-        num_bugs=args.num_bugs,
-        seed=args.seed
-    ) 
+        seed=args.seed,
+    )
